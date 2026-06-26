@@ -16,6 +16,23 @@ const START_XP = [30, 25, 20, 15];
 const START_TONS = [30, 25, 20, 15];
 const STATUS = ["-", "C", "R", "S", "Sc", "Cp", "P", "N"];
 const CREW_ROLES = ["Captain", "1st WO", "2nd WO/Medic", "Chief Engineer", "Bow Crew", "Midship Crew", "Stern Crew"];
+const OFFICER_ROLES = ["Captain", "1st WO", "2nd WO/Medic", "Chief Engineer"];
+const CREW_SECTION_ROLES = ["Bow Crew", "Midship Crew", "Stern Crew"];
+const OFFICER_WOUND_RESULTS = ["None", "Light", "Medium", "Heavy healed 8-10", "Heavy replaced 1-7", "KIA/Captured/Lost"];
+const PATROL_SEQUENCE = [
+  { step: "Approach", title: "U-boat Movement", scope: "Approach Map", ref: 28 },
+  { step: "Approach", title: "ASW Move, Search, Attack", scope: "Approach Map", ref: 39 },
+  { step: "Approach", title: "Damage Control", scope: "Approach Map", ref: 61 },
+  { step: "Attack", title: "Torpedo Move/Detonation", scope: "Attack Map", ref: 25 },
+  { step: "Attack", title: "U-boat Movement", scope: "Approach & Attack Maps", ref: 28 },
+  { step: "Attack", title: "U-boat Observation", scope: "Attack Map; surfaced or periscope depth only", ref: 37 },
+  { step: "Attack", title: "TDC Calculation", scope: "Attack Map; max 1 per targeted convoy ship unless enhanced", ref: 38 },
+  { step: "Attack", title: "ASW Move, Search, Attack", scope: "Approach & Attack Maps", ref: 39 },
+  { step: "Attack", title: "Convoy Movement", scope: "Attack Map, and Approach Map once Attack is active", ref: 55 },
+  { step: "Attack", title: "Torpedo Reload", scope: "Attack Map; not if Silent Running", ref: 58 },
+  { step: "Attack", title: "U-boat Attack", scope: "Attack Map; surfaced or periscope depth only", ref: 59 },
+  { step: "Attack", title: "Damage Control", scope: "Approach & Attack Maps; TP if Silent Running", ref: 61 },
+];
 
 const CAMPAIGN_TYPES = {
   full: { label: "Full Campaign", description: "18 Patrols · Oct 1941 to Mar 1943", length: 18, initialFP: 24 },
@@ -120,6 +137,7 @@ function newCampaign(name = "New Wolfpack Campaign") {
     initializedAtStart: false,
     boats: makeBoats(),
     patrols: [],
+    survivors: [],
     notes: "",
   };
 }
@@ -128,6 +146,7 @@ function migrateCampaign(c) {
   n.campaignType ||= "full";
   n.fpRefitCost ??= 8;
   n.initializedAtStart ??= false;
+  n.survivors ||= [];
   n.boats = (n.boats || []).map(b => ({ ...b, enhancements: { ...Object.fromEntries(CREW_ROLES.map(r => [r, []])), ...(b.enhancements || {}) } }));
   return n;
 }
@@ -141,6 +160,46 @@ function baseRefitMonths({ flooding = "none", heavyEngine = false, chiefEngineer
   if (heavyEngine) months += 1;
   if (chiefEngineerMinusOne) months = Math.max(0, months - 1);
   return months;
+}
+function enhancementById(id) {
+  for (const list of Object.values(ENHANCEMENTS)) {
+    const found = list.find(e => e.id === id);
+    if (found) return found;
+  }
+  return null;
+}
+function removeHighestCrewEnhancement(boat) {
+  const owned = CREW_SECTION_ROLES.flatMap(role => (boat.enhancements[role] || []).map(id => ({ role, id, level: enhancementById(id)?.level || 0 })));
+  if (!owned.length) return null;
+  owned.sort((a, b) => b.level - a.level);
+  const loss = owned[0];
+  boat.enhancements[loss.role] = boat.enhancements[loss.role].filter(id => id !== loss.id);
+  return loss;
+}
+function canAddEnhancement(boat, role, enh, { free = false } = {}) {
+  const list = boat.enhancements[role] || [];
+  return !list.includes(enh.id) && (!enh.prereq || list.includes(enh.prereq)) && (!enh.auto100k || boat.tonsK >= 100) && (free || enh.auto100k || boat.xp >= enh.cost);
+}
+function defaultOfficerWounds() {
+  return Object.fromEntries(OFFICER_ROLES.map(role => [role, "None"]));
+}
+function resolveOfficerCasualties(boat, entry) {
+  const officerLosses = [];
+  const officerWounds = { ...defaultOfficerWounds(), ...(entry.officerWounds || {}) };
+  OFFICER_ROLES.forEach(role => {
+    const result = officerWounds[role];
+    if (result === "KIA/Captured/Lost" || result === "Heavy replaced 1-7") {
+      officerLosses.push({ role, result, lostEnhancements: [...(boat.enhancements[role] || [])] });
+    }
+  });
+  const captainLost = officerLosses.some(x => x.role === "Captain");
+  if (captainLost && entry.actingCaptainRole === "1st WO") {
+    boat.enhancements.Captain = [...(boat.enhancements["1st WO"] || [])];
+    boat.enhancements["1st WO"] = [];
+    return { officerLosses, captainPromotion: "1st WO promoted to Captain" };
+  }
+  officerLosses.forEach(loss => { boat.enhancements[loss.role] = []; });
+  return { officerLosses, captainPromotion: captainLost ? "Captain replaced; Captain enhancements erased" : null };
 }
 function statusBadge(s) {
   const map = { C: "bg-emerald-100 text-emerald-700", R: "bg-amber-100 text-amber-700", S: "bg-red-100 text-red-700", Sc: "bg-orange-100 text-orange-700", Cp: "bg-purple-100 text-purple-700", P: "bg-sky-100 text-sky-700", N: "bg-slate-200 text-slate-500", "-": "bg-slate-100 text-slate-500" };
@@ -244,7 +303,7 @@ export default function WolfpackCampaignApp() {
     if (!boatId) return;
     setPatrolForm(f => f.boats.some(x => x.boatId === boatId) ? f : ({
       ...f,
-      boats: [...f.boats, { boatId, designation: ["W", "X", "Y", "Z"][f.boats.length] || "P", status: "C", tonsK: 0, escorts: 0, returned: true, scuttled: false, tpPurchased: 0, xpToFp: 0, flooding: "none", heavyEngine: false, fpRefitReduction: 0, crewWounds: { Bow: 0, Midship: 0, Stern: 0 }, notes: "" }]
+      boats: [...f.boats, { boatId, designation: ["W", "X", "Y", "Z"][f.boats.length] || "P", status: "C", tonsK: 0, escorts: 0, returned: true, scuttled: false, tpPurchased: 0, xpToFp: 0, flooding: "none", heavyEngine: false, fpRefitReduction: 0, crewWounds: { Bow: 0, Midship: 0, Stern: 0 }, officerWounds: defaultOfficerWounds(), actingCaptainRole: "", allCrewSectionsLost: false, replacementUboat: false, replacementVpPenalty: 0, freeCrewRole: "", freeCrewEnhancement: "", notes: "" }]
     }));
   }
   function updatePatrolBoat(boatId, patch) {
@@ -272,17 +331,51 @@ export default function WolfpackCampaignApp() {
         b.tonsK += gainedTons;
         b.log[monthIndex] = entry.status;
         for (let r = 1; r <= refit; r++) if (monthIndex + r < 18 && b.log[monthIndex + r] === "-") b.log[monthIndex + r] = "R";
-        if (["S", "Cp"].includes(entry.status)) {
+        const { officerLosses, captainPromotion } = ["S", "Cp"].includes(entry.status) ? { officerLosses: [], captainPromotion: null } : resolveOfficerCasualties(b, entry);
+        let crewSectionsLost = false;
+        if (entry.allCrewSectionsLost) {
+          CREW_SECTION_ROLES.forEach(role => { b.enhancements[role] = []; });
+          crewSectionsLost = true;
+        }
+        if (["S", "Sc", "Cp"].includes(entry.status)) {
           b.lost = true;
-          b.xp = 0;
-          Object.keys(b.enhancements).forEach(k => { b.enhancements[k] = []; });
+          if (["S", "Cp"].includes(entry.status)) {
+            b.xp = 0;
+            Object.keys(b.enhancements).forEach(k => { b.enhancements[k] = []; });
+          }
+          if (entry.status === "Sc") {
+            c.survivors ||= [];
+            c.survivors.push({
+              id: crypto.randomUUID(),
+              date: MONTHS[monthIndex].label,
+              fromBoatId: b.id,
+              fromBoat: b.name,
+              captainName: b.captainName,
+              xp: b.xp,
+              tonsK: b.tonsK,
+              enhancements: structuredClone(b.enhancements),
+              notes: entry.notes || "",
+            });
+          }
         }
         const woundLevel = Object.values(entry.crewWounds || {}).reduce((a, v) => a + safeNumber(v), 0);
         let woundLoss = woundLevel >= 9 ? 2 : woundLevel >= 5 ? 1 : 0;
-        if (woundLoss > 0) ["Bow Crew", "Midship Crew", "Stern Crew"].forEach(role => {
-          while (woundLoss > 0 && b.enhancements[role].length) { b.enhancements[role].pop(); woundLoss--; }
-        });
-        patrolRecord.boats.push({ ...entry, gainedXp, gainedTons, xpSpentOnTP, xpConvertedToFP, refit, woundLevel });
+        const lostEnhancements = [];
+        while (woundLoss > 0) {
+          const removed = removeHighestCrewEnhancement(b);
+          if (!removed) break;
+          lostEnhancements.push(removed);
+          woundLoss--;
+        }
+        let freeCrewEnhancement = null;
+        if (!lostEnhancements.length && entry.freeCrewRole && entry.freeCrewEnhancement) {
+          const enh = ENHANCEMENTS["Crew Section"].find(e => e.id === entry.freeCrewEnhancement);
+          if (enh && canAddEnhancement(b, entry.freeCrewRole, enh, { free: true })) {
+            b.enhancements[entry.freeCrewRole].push(enh.id);
+            freeCrewEnhancement = { role: entry.freeCrewRole, id: enh.id, name: enh.name };
+          }
+        }
+        patrolRecord.boats.push({ ...entry, gainedXp, gainedTons, xpSpentOnTP, xpConvertedToFP, refit, woundLevel, lostEnhancements, freeCrewEnhancement, officerLosses, captainPromotion, crewSectionsLost });
       });
       c.patrols.push(patrolRecord);
       const nextAllowed = campaignMonths(c).find(m => m.monthIndex > monthIndex)?.monthIndex ?? monthIndex;
@@ -297,10 +390,7 @@ export default function WolfpackCampaignApp() {
     updateCampaign(c => {
       const b = initBoat(c, c.boats.find(x => x.id === boatId));
       const list = b.enhancements[role];
-      if (!list || list.includes(enh.id)) return c;
-      if (enh.prereq && !list.includes(enh.prereq)) return c;
-      if (enh.auto100k && b.tonsK < 100) return c;
-      if (!enh.auto100k && b.xp < enh.cost) return c;
+      if (!list || !canAddEnhancement(b, role, enh)) return c;
       if (!enh.auto100k) b.xp -= enh.cost;
       list.push(enh.id);
       return c;
@@ -381,17 +471,84 @@ function PatrolBoatCard({ campaign, entry, updatePatrolBoat }) {
   const refit = baseRefitMonths({ flooding: entry.flooding, heavyEngine: entry.heavyEngine, chiefEngineerMinusOne: ceMinusOne });
   const xp = ["S", "Cp"].includes(entry.status) ? 0 : xpFromPatrol({ tonsK: entry.tonsK, returned: entry.returned && entry.status !== "Sc", scuttled: entry.status === "Sc", escortCount: entry.escorts });
   const woundLevel = Object.values(entry.crewWounds).reduce((a, v) => a + safeNumber(v), 0);
-  return <div className="card p-4"><div className="flex justify-between gap-2"><div><h3 className="text-lg font-black">{entry.designation} · {b.name}</h3><div className="small">{b.type} · XP now {b.xp} · {b.tonsK}k tons</div></div><div className="text-right"><div className="font-black text-2xl">+{xp} XP</div><div className="small">Refit: {Math.max(0, refit - safeNumber(entry.fpRefitReduction))} months</div></div></div><div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-4"><Field label="Designation"><select className="input w-full" value={entry.designation} onChange={e => updatePatrolBoat(entry.boatId, { designation: e.target.value })}>{["W", "X", "Y", "Z", "P"].map(x => <option key={x}>{x}</option>)}</select></Field><Field label="Final status"><select className="input w-full" value={entry.status} onChange={e => updatePatrolBoat(entry.boatId, { status: e.target.value, scuttled: e.target.value === "Sc" })}>{STATUS.filter(x => x !== "N" && x !== "R").map(x => <option key={x}>{x}</option>)}</select></Field><Field label="k Tons sunk"><input className="input w-full" type="number" value={entry.tonsK} onChange={e => updatePatrolBoat(entry.boatId, { tonsK: e.target.value })}/></Field><Field label="Damaged/sunk escorts"><input className="input w-full" type="number" value={entry.escorts} onChange={e => updatePatrolBoat(entry.boatId, { escorts: e.target.value })}/></Field><Field label="TP purchased"><input className="input w-full" type="number" min="0" max="6" value={entry.tpPurchased} onChange={e => updatePatrolBoat(entry.boatId, { tpPurchased: e.target.value })}/></Field><Field label="XP converted to FP"><input className="input w-full" type="number" min="0" value={entry.xpToFp} onChange={e => updatePatrolBoat(entry.boatId, { xpToFp: e.target.value })}/></Field><Field label="Flooding damage"><select className="input w-full" value={entry.flooding} onChange={e => updatePatrolBoat(entry.boatId, { flooding: e.target.value })}><option value="none">None</option><option value="L-O">L/O track area</option><option value="2ndO+">2nd O or worse</option></select></Field><Field label="Heavy diesel/electric"><select className="input w-full" value={entry.heavyEngine ? "yes" : "no"} onChange={e => updatePatrolBoat(entry.boatId, { heavyEngine: e.target.value === "yes" })}><option value="no">No</option><option value="yes">Yes</option></select></Field><Field label={`FP refit reduction (${campaign.fpRefitCost || 8}/month)`}><input className="input w-full" type="number" min="0" max={refit} value={entry.fpRefitReduction} onChange={e => updatePatrolBoat(entry.boatId, { fpRefitReduction: e.target.value })}/></Field><Field label="Crew wounds total"><div className="font-bold pt-2">{woundLevel} ({woundLevel >= 9 ? "lose 2" : woundLevel >= 5 ? "lose 1" : "no loss"})</div></Field></div><div className="grid grid-cols-3 gap-2 mt-3">{["Bow", "Midship", "Stern"].map(sec => <Field key={sec} label={`${sec} wound value`}><select className="input w-full" value={entry.crewWounds[sec]} onChange={e => updatePatrolBoat(entry.boatId, { crewWounds: { ...entry.crewWounds, [sec]: e.target.value } })}><option value="0">None 0</option><option value="1">Light 1</option><option value="2">Medium 2</option><option value="3">Heavy 3</option><option value="4">KIA 4</option></select></Field>)}</div></div>;
+  const officerWounds = { ...defaultOfficerWounds(), ...(entry.officerWounds || {}) };
+  const freeOptions = entry.freeCrewRole ? ENHANCEMENTS["Crew Section"].filter(e => canAddEnhancement(b, entry.freeCrewRole, e, { free: true })) : [];
+  return <div className="card p-4">
+    <div className="flex justify-between gap-2">
+      <div><h3 className="text-lg font-black">{entry.designation} · {b.name}</h3><div className="small">{b.type} · XP now {b.xp} · {b.tonsK}k tons</div></div>
+      <div className="text-right"><div className="font-black text-2xl">+{xp} XP</div><div className="small">Refit: {Math.max(0, refit - safeNumber(entry.fpRefitReduction))} months</div></div>
+    </div>
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-4">
+      <Field label="Designation"><select className="input w-full" value={entry.designation} onChange={e => updatePatrolBoat(entry.boatId, { designation: e.target.value })}>{["W", "X", "Y", "Z", "P"].map(x => <option key={x}>{x}</option>)}</select></Field>
+      <Field label="Final status"><select className="input w-full" value={entry.status} onChange={e => updatePatrolBoat(entry.boatId, { status: e.target.value, scuttled: e.target.value === "Sc" })}>{STATUS.filter(x => x !== "N" && x !== "R").map(x => <option key={x}>{x}</option>)}</select></Field>
+      <Field label="k Tons sunk"><input className="input w-full" type="number" value={entry.tonsK} onChange={e => updatePatrolBoat(entry.boatId, { tonsK: e.target.value })}/></Field>
+      <Field label="Damaged/sunk escorts"><input className="input w-full" type="number" value={entry.escorts} onChange={e => updatePatrolBoat(entry.boatId, { escorts: e.target.value })}/></Field>
+      <Field label="Replacement U-boat"><select className="input w-full" value={entry.replacementUboat ? "yes" : "no"} onChange={e => updatePatrolBoat(entry.boatId, { replacementUboat: e.target.value === "yes" })}><option value="no">No</option><option value="yes">Yes, Approach loss replacement</option></select></Field>
+      <Field label="Replacement VP penalty"><input className="input w-full" type="number" min="0" value={entry.replacementVpPenalty || 0} onChange={e => updatePatrolBoat(entry.boatId, { replacementVpPenalty: e.target.value })}/></Field>
+      <Field label="TP purchased"><input className="input w-full" type="number" min="0" max="6" value={entry.tpPurchased} onChange={e => updatePatrolBoat(entry.boatId, { tpPurchased: e.target.value })}/></Field>
+      <Field label="XP converted to FP"><input className="input w-full" type="number" min="0" value={entry.xpToFp} onChange={e => updatePatrolBoat(entry.boatId, { xpToFp: e.target.value })}/></Field>
+      <Field label="Flooding damage"><select className="input w-full" value={entry.flooding} onChange={e => updatePatrolBoat(entry.boatId, { flooding: e.target.value })}><option value="none">None</option><option value="L-O">L/O track area</option><option value="2ndO+">2nd O or worse</option></select></Field>
+      <Field label="Heavy diesel/electric"><select className="input w-full" value={entry.heavyEngine ? "yes" : "no"} onChange={e => updatePatrolBoat(entry.boatId, { heavyEngine: e.target.value === "yes" })}><option value="no">No</option><option value="yes">Yes</option></select></Field>
+      <Field label={`FP refit reduction (${campaign.fpRefitCost || 8}/month)`}><input className="input w-full" type="number" min="0" max={refit} value={entry.fpRefitReduction} onChange={e => updatePatrolBoat(entry.boatId, { fpRefitReduction: e.target.value })}/></Field>
+      <Field label="Crew wounds total"><div className="font-bold pt-2">{woundLevel} ({woundLevel >= 9 ? "lose 2" : woundLevel >= 5 ? "lose 1" : "no loss"})</div></Field>
+    </div>
+    <div className="grid grid-cols-3 gap-2 mt-3">
+      {["Bow", "Midship", "Stern"].map(sec => <Field key={sec} label={`${sec} wound value`}><select className="input w-full" value={entry.crewWounds[sec]} onChange={e => updatePatrolBoat(entry.boatId, { crewWounds: { ...entry.crewWounds, [sec]: e.target.value } })}><option value="0">None 0</option><option value="1">Light 1</option><option value="2">Medium 2</option><option value="3">Heavy 3</option><option value="4">KIA 4</option></select></Field>)}
+    </div>
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-3">
+      {OFFICER_ROLES.map(role => <Field key={role} label={`${role} post-patrol result`}><select className="input w-full" value={officerWounds[role]} onChange={e => updatePatrolBoat(entry.boatId, { officerWounds: { ...officerWounds, [role]: e.target.value } })}>{OFFICER_WOUND_RESULTS.map(result => <option key={result}>{result}</option>)}</select></Field>)}
+      <Field label="Acting Captain promoted"><select className="input w-full" value={entry.actingCaptainRole || ""} onChange={e => updatePatrolBoat(entry.boatId, { actingCaptainRole: e.target.value })}><option value="">No Captain promotion</option><option value="1st WO">1st WO becomes Captain</option><option value="2nd WO/Medic">Lower officer acted; Captain replaced</option><option value="Chief Engineer">Chief Engineer acted; Captain replaced</option></select></Field>
+      <Field label="All Crew Sections captured/lost/KIA"><select className="input w-full" value={entry.allCrewSectionsLost ? "yes" : "no"} onChange={e => updatePatrolBoat(entry.boatId, { allCrewSectionsLost: e.target.value === "yes" })}><option value="no">No</option><option value="yes">Yes, erase Crew Section enhancements</option></select></Field>
+    </div>
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-3">
+      <Field label="Free crew enhancement section"><select className="input w-full" value={entry.freeCrewRole || ""} onChange={e => updatePatrolBoat(entry.boatId, { freeCrewRole: e.target.value, freeCrewEnhancement: "" })}><option value="">None</option>{CREW_SECTION_ROLES.map(role => <option key={role} value={role}>{role}</option>)}</select></Field>
+      <Field label="Free crew enhancement"><select className="input w-full" value={entry.freeCrewEnhancement || ""} disabled={!entry.freeCrewRole || woundLevel >= 5} onChange={e => updatePatrolBoat(entry.boatId, { freeCrewEnhancement: e.target.value })}><option value="">{woundLevel >= 5 ? "Not available after wound loss" : "Select enhancement"}</option>{freeOptions.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></Field>
+    </div>
+    <textarea className="input w-full min-h-20 mt-3" placeholder="U-boat notes, officer wounds, return event details" value={entry.notes || ""} onChange={e => updatePatrolBoat(entry.boatId, { notes: e.target.value })}/>
+  </div>;
 }
 
 function CrewPanel({ campaign, boat, setSelectedBoat, buyEnhancement, convertXpToFp }) {
   const [convert, setConvert] = useState(0);
-  return <div className="grid grid-cols-1 lg:grid-cols-4 gap-4"><div className="card p-4 space-y-3"><h2 className="text-xl font-black">U-boat Crew</h2><select className="input w-full" value={boat.id} onChange={e => setSelectedBoat(e.target.value)}>{campaign.boats.map(b => <option key={b.id} value={b.id}>{b.name} · {b.flotilla}</option>)}</select><div className="bg-slate-900 rounded-xl p-3"><div className="font-black text-2xl">{boat.name}</div><div className="small">{boat.type} · {boat.captainName}</div><div className="mt-3 grid grid-cols-2 gap-2"><div><div className="small">XP</div><b>{boat.xp}</b></div><div><div className="small">k Tons</div><b>{boat.tonsK}</b></div></div></div><div className="flex gap-2"><input className="input w-full" type="number" value={convert} onChange={e => setConvert(e.target.value)} /><button className="btn" onClick={() => { convertXpToFp(boat.id, convert); setConvert(0); }}>XP → FP</button></div><div className="small">XP conversion is 1:1 into the campaign Flotilla Points pool.</div></div><div className="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 gap-3">{CREW_ROLES.map(role => <EnhancementRole key={role} boat={boat} role={role} buyEnhancement={buyEnhancement} />)}</div></div>;
+  return <div className="grid grid-cols-1 lg:grid-cols-4 gap-4"><div className="card p-4 space-y-3"><h2 className="text-xl font-black">U-boat Crew</h2><select className="input w-full" value={boat.id} onChange={e => setSelectedBoat(e.target.value)}>{campaign.boats.map(b => <option key={b.id} value={b.id}>{b.name} · {b.flotilla}</option>)}</select><div className="bg-slate-900 rounded-xl p-3"><div className="font-black text-2xl">{boat.name}</div><div className="small">{boat.type} · {boat.captainName}</div><div className="mt-3 grid grid-cols-2 gap-2"><div><div className="small">XP</div><b>{boat.xp}</b></div><div><div className="small">k Tons</div><b>{boat.tonsK}</b></div></div></div><div className="flex gap-2"><input className="input w-full" type="number" value={convert} onChange={e => setConvert(e.target.value)} /><button className="btn" onClick={() => { convertXpToFp(boat.id, convert); setConvert(0); }}>XP → FP</button></div><div className="small">XP conversion is 1:1 into the campaign Flotilla Points pool.</div><div className="bg-slate-900 rounded-xl p-3 border border-slate-700"><h3 className="font-black">Scuttled survivors</h3><div className="small mt-1">Surviving Officers and Crew Sections retain enhancements and can be assigned as replacements during setup.</div><div className="space-y-2 mt-3">{(campaign.survivors || []).length === 0 && <div className="small">No survivor crews recorded.</div>}{(campaign.survivors || []).map(s => <div key={s.id} className="bg-slate-950 rounded-lg p-2 small"><b>{s.fromBoat}</b> · {s.date}<br/>{s.xp} XP · {s.tonsK}k tons · Captain {s.captainName}</div>)}</div></div></div><div className="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 gap-3">{CREW_ROLES.map(role => <EnhancementRole key={role} boat={boat} role={role} buyEnhancement={buyEnhancement} />)}</div></div>;
 }
 function EnhancementRole({ boat, role, buyEnhancement }) {
   const tableKey = role.includes("Crew") ? "Crew Section" : role;
   const purchased = boat.enhancements[role] || [];
   return <div className="card p-4"><h3 className="font-black mb-2">{role}</h3><div className="space-y-2">{ENHANCEMENTS[tableKey].map(e => { const ok = !purchased.includes(e.id) && (!e.prereq || purchased.includes(e.prereq)) && (!e.auto100k || boat.tonsK >= 100) && (e.auto100k || boat.xp >= e.cost); return <div key={e.id} className={`p-3 rounded-xl border ${purchased.includes(e.id) ? "bg-emerald-950 border-emerald-700" : "bg-slate-900 border-slate-700"}`}><div className="flex justify-between gap-2"><div><b>{e.name}</b><div className="small">Level {e.level} · {e.auto100k ? "Auto at 100k tons" : `${e.cost} XP`} · {e.effect}</div></div><button disabled={!ok} className="btn" onClick={() => buyEnhancement(boat.id, role, e)}>{purchased.includes(e.id) ? "Owned" : "Buy"}</button></div></div>; })}</div></div>;
 }
-function History({ campaign }) { return <div className="card p-4"><h2 className="text-xl font-black mb-3">Patrol History</h2><div className="space-y-3">{campaign.patrols.length === 0 && <div className="small">No patrols logged yet.</div>}{campaign.patrols.map(p => <div key={p.id} className="bg-slate-900 rounded-xl p-3 border border-slate-700"><div className="flex justify-between"><b>{p.date}</b><b>{p.vp} VP</b></div><div className="small mt-1">{p.notes}</div><div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">{p.boats.map(b => <div key={b.boatId} className="small bg-slate-950 rounded-lg p-2">{b.designation}: {b.status} · +{b.gainedXp} XP · +{b.gainedTons}k tons · TP XP {b.xpSpentOnTP || 0} · FP +{b.xpConvertedToFP || 0} · refit {b.refit}</div>)}</div></div>)}</div></div>; }
-function RulesHelper() { return <div className="grid grid-cols-1 md:grid-cols-2 gap-4"><div className="card p-4"><h2 className="text-xl font-black">Automated formulas</h2><ul className="list-disc pl-5 space-y-2 text-slate-300 mt-3"><li>Campaign types: Full Campaign, Early War Campaign, Single War Period Campaign, and Single Patrol.</li><li>Initial U-boat values by flotilla slot: #1 30 XP/30k tons, #2 25 XP/25k tons, #3 20 XP/20k tons, #4 15 XP/15k tons.</li><li>Each U-boat starts a Patrol with 2 free TP. Additional TP cost 5 XP each, up to 8 TP total.</li><li>XP may be converted into the shared Flotilla Points pool.</li><li>Returning crew XP: 1 XP per 1,000 tons sunk.</li><li>Returned to base: +20 XP. Scuttled with crew returning: +15 XP.</li><li>Each damaged or sunk Escort on that U-boat board: +20 XP.</li><li>Refit: 1 month for Flooding L/O area, 2 months for 2nd O or worse, +1 month for heavy diesel/electric engine damage.</li><li>Chief Engineer -1 Month Repair enhancement reduces refit by 1 month.</li><li>FP refit reduction cost is configurable: the rulebook Set-up section uses 8 FP/month; the Crew Enhancement reference sheet shows 15 FP/month.</li></ul></div><div className="card p-4"><h2 className="text-xl font-black">Manual inputs still needed</h2><p className="text-slate-300 mt-3">The app does not draw Battle, Patrol, Combat or Damage cards. Enter final Patrol VP, sunk tonnage per U-boat, Return to Base outcomes, wound values, TP purchases, XP-to-FP conversion, and refit-relevant damage after resolving the tabletop game.</p><button className="btn mt-4" onClick={() => { localStorage.removeItem("wolfpack-campaigns-v1"); localStorage.removeItem("wolfpack-campaigns-v2"); }}><RotateCcw className="w-4 h-4" /> Clear saved browser data on reload</button></div></div>; }
+function History({ campaign }) { return <div className="card p-4"><h2 className="text-xl font-black mb-3">Patrol History</h2><div className="space-y-3">{campaign.patrols.length === 0 && <div className="small">No patrols logged yet.</div>}{campaign.patrols.map(p => <div key={p.id} className="bg-slate-900 rounded-xl p-3 border border-slate-700"><div className="flex justify-between"><b>{p.date}</b><b>{p.vp} VP</b></div><div className="small mt-1">{p.notes}</div><div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">{p.boats.map(b => <div key={b.boatId} className="small bg-slate-950 rounded-lg p-2">{b.designation}: {b.status} · +{b.gainedXp} XP · +{b.gainedTons}k tons · TP XP {b.xpSpentOnTP || 0} · FP +{b.xpConvertedToFP || 0} · refit {b.refit}{b.replacementUboat ? ` · replacement penalty ${b.replacementVpPenalty || 0} VP` : ""}{b.officerLosses?.length ? ` · officer losses: ${b.officerLosses.map(x => x.role).join(", ")}` : ""}{b.captainPromotion ? ` · ${b.captainPromotion}` : ""}{b.crewSectionsLost ? " · all Crew Section enhancements erased" : ""}{b.lostEnhancements?.length ? ` · lost ${b.lostEnhancements.length} crew enh.` : ""}{b.freeCrewEnhancement ? ` · free ${b.freeCrewEnhancement.role}: ${b.freeCrewEnhancement.name}` : ""}</div>)}</div></div>)}</div></div>; }
+function RulesHelper() {
+  return <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div className="card p-4 lg:col-span-2">
+      <h2 className="text-xl font-black">Patrol Sequence</h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+        {["Approach", "Attack"].map(group => <div key={group} className="bg-slate-900 rounded-xl p-3 border border-slate-700">
+          <h3 className="font-black mb-2">{group}</h3>
+          <div className="space-y-2">{PATROL_SEQUENCE.filter(s => s.step === group).map((s, i) => <div key={`${group}-${s.title}`} className="flex gap-3 rounded-lg bg-slate-950 p-2">
+            <div className="gridcell bg-slate-800 text-slate-100">{i + 1}</div>
+            <div><div className="font-bold">{s.title} <span className="small">[{s.ref}]</span></div><div className="small">{s.scope}</div></div>
+          </div>)}</div>
+        </div>)}
+      </div>
+    </div>
+    <div className="card p-4">
+      <h2 className="text-xl font-black">Automated formulas</h2>
+      <ul className="list-disc pl-5 space-y-2 text-slate-300 mt-3">
+        <li>Status codes match the Campaign Log: C, N, S, Sc, P, R, Cp, W/X/Y/Z.</li>
+        <li>Initial U-boat values by flotilla slot: #1 30 XP/30k tons, #2 25 XP/25k tons, #3 20 XP/20k tons, #4 15 XP/15k tons.</li>
+        <li>Each U-boat starts a Patrol with 2 free TP. Additional TP cost 5 XP each, up to 8 TP total.</li>
+        <li>Returning crew XP: 1 XP per 1,000 tons sunk, +20 XP for return to base, +15 XP if scuttled crew returns, +20 XP per damaged or sunk Escort.</li>
+        <li>Wound level 5-8 removes one highest Crew Section enhancement; 9+ removes two. No loss can award one free Crew Section enhancement.</li>
+        <li>Officer KIA/captured/lost, or Heavy Wounds with a 1-7 post-patrol result, erases that Officer enhancement track.</li>
+        <li>If the Captain is lost and the 1st WO is promoted, the 1st WO enhancements move to Captain and the 1st WO track is cleared.</li>
+        <li>Sunk or captured U-boats lose all XP and enhancements. Scuttled U-boats are lost, but surviving crew records are retained in the Crew tab.</li>
+        <li>All Crew Sections captured/lost/KIA erases all Crew Section enhancements.</li>
+        <li>Refit: 1 month for Flooding L/O area, 2 months for 2nd O or worse, +1 month for heavy diesel/electric engine damage.</li>
+        <li>FP refit reduction cost is configurable: the rulebook Set-up section uses 8 FP/month; the Crew Enhancement reference sheet shows 15 FP/month.</li>
+      </ul>
+      <p className="text-slate-300 mt-4">The app does not draw Battle, Patrol, Combat or Damage cards. Enter final Patrol VP, tonnage, return events, wounds, TP purchases, XP-to-FP conversion, and refit damage after resolving the tabletop game.</p>
+      <button className="btn mt-4" onClick={() => { localStorage.removeItem("wolfpack-campaigns-v1"); localStorage.removeItem("wolfpack-campaigns-v2"); }}><RotateCcw className="w-4 h-4" /> Clear saved browser data on reload</button>
+    </div>
+  </div>;
+}
