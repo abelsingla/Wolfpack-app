@@ -1,5 +1,7 @@
 node_modules/
 dist/
 dist 2/
+release/
 .DS_Store
 *.zip
+*.exe
